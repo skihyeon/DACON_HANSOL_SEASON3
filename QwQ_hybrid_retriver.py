@@ -4,7 +4,7 @@ warnings.filterwarnings("ignore", message="TypedStorage is deprecated")
 import pandas as pd
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 from langchain.chains import RetrievalQA
 from langchain_huggingface import HuggingFacePipeline
 from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -16,8 +16,13 @@ import time
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 import json  # JSON 파일 저장을 위한 모듈 추가
+from langchain_community.retrievers import BM25Retriever
+from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+from typing import List, Any, Dict
+import numpy as np
 
 def load_data():
     """데이터 로드 함수"""
@@ -89,7 +94,7 @@ def setup_model():
         torch_dtype=torch.float16
     )
     
-    return tokenizer, model
+    return tokenizer, model, model_id
 
 def create_train_documents(combined_training_data):
     """개선된 학습 문서 생성 함수 - 청킹 적용"""
@@ -123,18 +128,87 @@ def create_train_documents(combined_training_data):
     
     return chunks, chunk_metadatas
 
-def setup_retriever(train_documents, train_metadatas):
-    """리트리버 설정 함수 - Chroma 사용 (개선됨)"""
-    print("Chroma 벡터 저장소 설정 중...")
+class HybridRetriever(BaseRetriever):
+    """하이브리드 검색 리트리버 클래스"""
+    
+    # Pydantic 모델 필드 정의
+    bm25_retriever: Any  # 타입 힌트 추가
+    vector_retriever: Any  # 타입 힌트 추가
+    bm25_weight: float = 0.3  # 기본값 설정
+    vector_weight: float = 0.7  # 기본값 설정
+    vectorstore: Any = None  # 선택적 필드
+    
+    class Config:
+        """Pydantic 설정 클래스"""
+        arbitrary_types_allowed = True  # 임의 타입 허용
+    
+    def __init__(self, bm25_retriever, vector_retriever, bm25_weight=0.3):
+        """하이브리드 리트리버 초기화"""
+        # 필드 값 설정
+        vector_weight = 1.0 - bm25_weight
+        vectorstore = getattr(vector_retriever, 'vectorstore', None)
+        
+        # 부모 클래스 초기화 (필드 값 전달)
+        super().__init__(
+            bm25_retriever=bm25_retriever,
+            vector_retriever=vector_retriever,
+            bm25_weight=bm25_weight,
+            vector_weight=vector_weight,
+            vectorstore=vectorstore
+        )
+    
+    def _get_relevant_documents(self, query, *, run_manager=None):
+        """관련 문서 검색 메서드 (BaseRetriever 인터페이스 구현)"""
+        # BM25 검색 결과 가져오기
+        bm25_docs = self.bm25_retriever.get_relevant_documents(query)
+        
+        # 벡터 검색 결과 가져오기
+        vector_docs = self.vector_retriever.get_relevant_documents(query)
+        
+        # 결과 합치기 (중복 제거 및 점수 계산)
+        all_docs = {}
+        
+        # BM25 결과 처리
+        for i, doc in enumerate(bm25_docs):
+            doc_id = doc.metadata.get('source', f'bm25_{i}')
+            score = 1.0 - (i / len(bm25_docs))  # 순위 기반 점수 계산
+            all_docs[doc_id] = {
+                'doc': doc,
+                'score': score * self.bm25_weight
+            }
+        
+        # 벡터 검색 결과 처리
+        for i, doc in enumerate(vector_docs):
+            doc_id = doc.metadata.get('source', f'vector_{i}')
+            score = 1.0 - (i / len(vector_docs))  # 순위 기반 점수 계산
+            
+            if doc_id in all_docs:
+                all_docs[doc_id]['score'] += score * self.vector_weight
+            else:
+                all_docs[doc_id] = {
+                    'doc': doc,
+                    'score': score * self.vector_weight
+                }
+        
+        # 점수 기준으로 정렬
+        sorted_docs = sorted(all_docs.values(), key=lambda x: x['score'], reverse=True)
+        
+        # 상위 문서 반환 (최대 12개)
+        return [item['doc'] for item in sorted_docs[:12]]
+
+def setup_hybrid_retriever(train_documents, train_metadatas):
+    """하이브리드 리트리버 설정 함수"""
+    print("하이브리드 검색 시스템 설정 중...")
     start_time = time.time()
     
+    # 1. 의미 기반 검색을 위한 임베딩 모델 설정
     embedding = HuggingFaceEmbeddings(
-        model_name="snunlp/KR-SBERT-V40K-klueNLI-augSTS",
-        # model_name= "sentence-transformers/text-embedding-3-large",
+        model_name="jhgan/ko-sroberta-multitask",
         model_kwargs={"device": "cuda"}
     )
     
-    persist_directory = "./chroma_db_improved"
+    # 2. 벡터 저장소 설정
+    persist_directory = "./chroma_db_hybrid"
     
     if os.path.exists(persist_directory) and len(os.listdir(persist_directory)) > 0:
         print(f"기존 Chroma DB 로드 중: {persist_directory}")
@@ -154,17 +228,32 @@ def setup_retriever(train_documents, train_metadatas):
             ids=ids
         )
     
-    end_time = time.time()
-    print(f"Chroma 벡터 저장소 설정 완료! 소요 시간: {end_time - start_time:.2f}초")
+    # 3. 키워드 기반 검색(BM25) 설정
+    # Document 객체로 변환
+    bm25_docs = []
+    for i, (text, metadata) in enumerate(zip(train_documents, train_metadatas)):
+        bm25_docs.append(Document(page_content=text, metadata=metadata))
     
-    return vector_store.as_retriever(
+    bm25_retriever = BM25Retriever.from_documents(bm25_docs)
+    bm25_retriever.k = 15  # 상위 15개 문서 검색
+    
+    # 4. 벡터 기반 검색 설정
+    vector_retriever = vector_store.as_retriever(
         search_type="mmr", 
         search_kwargs={
-            "k": 12,  # 7에서 증가
-            "fetch_k": 35,  # 20에서 증가
-            "lambda_mult": 0.6  # 0.7에서 감소
+            "k": 12,
+            "fetch_k": 35,
+            "lambda_mult": 0.6
         }
     )
+    
+    # 5. 하이브리드 검색 구현 (가중치 적용)
+    hybrid_retriever = HybridRetriever(bm25_retriever, vector_retriever, bm25_weight=0.3)
+    
+    end_time = time.time()
+    print(f"하이브리드 검색 시스템 설정 완료! 소요 시간: {end_time - start_time:.2f}초")
+    
+    return hybrid_retriever
 
 def setup_qa_chain(model, tokenizer, retriever):
     """QA 체인 설정 함수 - 최적화된 파이프라인 (개선됨)"""
@@ -250,27 +339,17 @@ def run_test(qa_chain, combined_test_data):
     pipeline_model = qa_chain.combine_documents_chain.llm_chain.llm.pipeline
     prompt_template = qa_chain.combine_documents_chain.llm_chain.prompt.template
     
-    collection = qa_chain.retriever.vectorstore._collection
-    embedding_func = qa_chain.retriever.vectorstore._embedding_function
-    
+    # 하이브리드 리트리버에서 직접 문서 검색
     def get_context(question):
-        query_embedding = embedding_func.embed_query(question)
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=7,
-            include=["documents", "metadatas", "distances"] 
-        )
+        docs = qa_chain.retriever.get_relevant_documents(question)
         
-        docs = results['documents'][0]
-        metadatas = results['metadatas'][0]
-        distances = results['distances'][0]
-        
-        # 거리에 따른 가중치 적용
+        # 문서 가공 및 가중치 적용
         weighted_docs = []
-        for doc, meta, dist in zip(docs, metadatas, distances):
-            weight = 1.0 - min(dist, 0.99)  
-            source_info = f"[출처: {meta.get('source', 'unknown')}]"
-            weighted_docs.append(f"[관련도: {weight:.2f}] {source_info}\n{doc}")
+        for i, doc in enumerate(docs):
+            # 순위 기반 가중치 계산
+            weight = 1.0 - (i / len(docs))
+            source_info = f"[출처: {doc.metadata.get('source', 'unknown')}]"
+            weighted_docs.append(f"[관련도: {weight:.2f}] {source_info}\n{doc.page_content}")
         
         return "\n\n".join(weighted_docs)
     
@@ -310,13 +389,13 @@ def run_test(qa_chain, combined_test_data):
             outputs = pipeline_model(
                 examples["prompt"],
                 do_sample=True,
-                temperature=0.3,
-                top_p=0.85,
-                top_k=50,
-                repetition_penalty=1.2,
-                max_new_tokens=128,
+                temperature=0.1,  # 하이퍼파라미터 적용
+                top_p=0.92,
+                top_k=30,
+                repetition_penalty=1.5,
+                max_new_tokens=200,
                 return_full_text=False,
-                batch_size=2  # 배치 크기 2로 수정
+                batch_size=2
             )
         
         results = []
@@ -456,7 +535,7 @@ def save_results(test_results, pred_embeddings, model_id, prompt_template, hyper
     model_name = model_id.split('/')[-1]
     
     # 파일 이름 기본 형식 (확장자 제외)
-    base_filename = f'./submissions/submission_{current_time}_{model_name}'
+    base_filename = f'./submissions/submission_{current_time}_{model_name}_hybrid'
     
     # CSV 파일 저장
     csv_filename = f'{base_filename}.csv'
@@ -466,14 +545,17 @@ def save_results(test_results, pred_embeddings, model_id, prompt_template, hyper
     config_data = {
         "model_id": model_id,
         "timestamp": current_time,
+        "retriever": "hybrid_bm25_vector",
+        "bm25_weight": 0.3,
+        "vector_weight": 0.7,
         "prompt_template": prompt_template,
         "hyperparameters": hyperparams,
         "batch_size": hyperparams.get("batch_size", 2),
-        "temperature": hyperparams.get("temperature", 0.3),
-        "top_p": hyperparams.get("top_p", 0.85),
-        "top_k": hyperparams.get("top_k", 50),
-        "repetition_penalty": hyperparams.get("repetition_penalty", 1.2),
-        "max_new_tokens": hyperparams.get("max_new_tokens", 128)
+        "temperature": hyperparams.get("temperature", 0.1),
+        "top_p": hyperparams.get("top_p", 0.92),
+        "top_k": hyperparams.get("top_k", 30),
+        "repetition_penalty": hyperparams.get("repetition_penalty", 1.5),
+        "max_new_tokens": hyperparams.get("max_new_tokens", 200)
     }
     
     json_filename = f'{base_filename}.json'
@@ -498,12 +580,13 @@ def main():
     
     print("모델 및 토크나이저 설정 중...")
     # 모델 ID 저장
-    model_id = "Qwen/Qwen2.5-14B-Instruct"
-    tokenizer, model = setup_model()
+    tokenizer, model, model_id = setup_model()
     
     print("학습 문서 생성 중...")
     train_documents, train_metadatas = create_train_documents(combined_training_data)
-    retriever = setup_retriever(train_documents, train_metadatas)
+    
+    print("하이브리드 리트리버 설정 중...")
+    retriever = setup_hybrid_retriever(train_documents, train_metadatas)
     
     print("QA 체인 설정 중...")
     qa_chain, prompt_template, hyperparams = setup_qa_chain(model, tokenizer, retriever)
