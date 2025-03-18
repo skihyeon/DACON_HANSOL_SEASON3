@@ -18,6 +18,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import json  # JSON 파일 저장을 위한 모듈 추가
+from PyPDF2 import PdfReader
+import glob
 
 def load_data():
     """데이터 로드 함수"""
@@ -91,18 +93,34 @@ def setup_model():
     
     return tokenizer, model
 
-def create_train_documents(combined_training_data):
-    """개선된 학습 문서 생성 함수 - 청킹 적용"""
+def create_train_documents(combined_training_data, train_df):
+    """개선된 학습 문서 생성 함수 - 메타데이터 활용"""
     train_questions = combined_training_data['question'].tolist()
     train_answers = combined_training_data['answer'].tolist()
     raw_documents = [f"Q: {q}\nA: {a}" for q, a in zip(train_questions, train_answers)]
     
-    metadatas = [{"source": f"doc_{i}", "type": "QA", "question": q, "answer": a} 
-                for i, (q, a) in enumerate(zip(train_questions, train_answers))]
+    # 메타데이터에 분류 정보 추가
+    metadatas = []
+    for i, (q, a) in enumerate(zip(train_questions, train_answers)):
+        meta = {
+            "source": f"doc_{i}",
+            "type": "QA",
+            "question": q,
+            "answer": a,
+            "공사종류_대분류": train_df.iloc[i]['공사종류(대분류)'],
+            "공사종류_중분류": train_df.iloc[i]['공사종류(중분류)'],
+            "공종_대분류": train_df.iloc[i]['공종(대분류)'],
+            "공종_중분류": train_df.iloc[i]['공종(중분류)'],
+            "사고객체_대분류": train_df.iloc[i]['사고객체(대분류)'],
+            "사고객체_중분류": train_df.iloc[i]['사고객체(중분류)'],
+            "작업프로세스": train_df.iloc[i]['작업프로세스'],
+            "사고원인": train_df.iloc[i]['사고원인']
+        }
+        metadatas.append(meta)
     
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=150,
+        chunk_size=1200,
+        chunk_overlap=240,
         separators=["\n\n", "\n", ".", "?", "!", " ", ""],
         keep_separator=True
     )
@@ -130,7 +148,6 @@ def setup_retriever(train_documents, train_metadatas):
     
     embedding = HuggingFaceEmbeddings(
         model_name="snunlp/KR-SBERT-V40K-klueNLI-augSTS",
-        # model_name= "sentence-transformers/text-embedding-3-large",
         model_kwargs={"device": "cuda"}
     )
     
@@ -173,12 +190,12 @@ def setup_qa_chain(model, tokenizer, retriever):
     
     # 하이퍼파라미터 설정
     hyperparams = {
-        "temperature": 0.1,  # 더 결정적인 응답을 위해 낮춤
-        "top_p": 0.92,  # 약간 높임
-        "top_k": 30,  # 관련성 높은 토큰에 더 집중
+        "temperature": 0.3,  # 더 결정적인 응답을 위해 낮춤
+        "top_p": 0.85,  # 약간 높임
+        "top_k": 50,  # 관련성 높은 토큰에 더 집중
         "repetition_penalty": 1.5,  # 반복 방지 강화
         "max_new_tokens": 200,  # 더 긴 응답 허용
-        "batch_size": 2  # 배치 크기 유지
+        "batch_size": 4  # 배치 크기 유지
     }
     
     text_generation_pipeline = pipeline(
@@ -198,21 +215,21 @@ def setup_qa_chain(model, tokenizer, retriever):
         device_map="auto"
     )
     
-    # 개선된 상세 프롬프트 템플릿
+    # 개선된 상세 프롬프트 템플릿 - 범용 패턴 강제 포함
     prompt_template = """
     <|im_start|>system
     당신은 건설 현장 안전 관리 전문가로, 건설 사고 예방과 재발 방지를 위한 구체적인 대책을 제시하는 역할을 맡고 있습니다.
 
     답변 작성 지침:
-    1. 핵심적인 안전 대책만 간결하고 명확하게 나열하세요.
-    2. 각 대책은 구체적이고 실행 가능해야 합니다.
-    3. 서론, 배경 설명, 결론 등은 포함하지 마세요.
-    4. "다음과 같은 조치를 취할 것을 제안합니다", "이러한 대책이 필요합니다" 등의 불필요한 문구는 사용하지 마세요.
-    5. 모든 대책은 "-" 또는 "•" 기호로 시작하는 항목으로 나열하세요.
-    6. 유사한 대책을 중복해서 제시하지 마세요.
-    7. 작업 환경, 안전 장비, 교육, 관리 감독, 제도적 측면 등 다양한 관점에서 대책을 제시하세요.
-    8. 제시된 사고 유형, 작업 프로세스, 사고 원인에 직접적으로 관련된 대책을 우선적으로 제시하세요.
-    9. 즉각적인 조치와 장기적인 대책을 균형 있게 포함하세요.
+    1. 모든 답변은 반드시 "작업 전 안전교육 실시와 안전관리자 안전점검 실시"를 첫 번째 항목으로 포함해야 합니다.
+    2. 핵심적인 안전 대책만 간결하고 명확하게 나열하세요.
+    3. 각 대책은 구체적이고 실행 가능해야 합니다.
+    4. 서론, 배경 설명, 결론 등은 포함하지 마세요.
+    5. "다음과 같은 조치를 취할 것을 제안합니다", "이러한 대책이 필요합니다" 등의 불필요한 문구는 사용하지 마세요.
+    6. 모든 대책은 "-" 또는 "•" 기호로 시작하는 항목으로 나열하세요.
+    7. 유사한 대책을 중복해서 제시하지 마세요.
+    8. 작업 환경, 안전 장비, 교육, 관리 감독, 제도적 측면 등 다양한 관점에서 대책을 제시하세요.
+    9. 제시된 사고 유형, 작업 프로세스, 사고 원인에 직접적으로 관련된 대책을 우선적으로 제시하세요.
     10. 모든 대책은 한국 건설 현장의 실정에 맞게 현실적이고 적용 가능해야 합니다.<|im_end|>
 
     <|im_start|>user
@@ -224,6 +241,7 @@ def setup_qa_chain(model, tokenizer, retriever):
 
     <|im_start|>assistant
     재발 방지 대책 및 향후 조치 계획:
+    - 작업자 안전교육 실시와 안전관리자 안전점검 실시
     """
 
     llm = HuggingFacePipeline(pipeline=text_generation_pipeline)
@@ -240,7 +258,67 @@ def setup_qa_chain(model, tokenizer, retriever):
     # 프롬프트 템플릿과 하이퍼파라미터를 함께 반환
     return qa_chain, prompt_template, hyperparams
 
-def run_test(qa_chain, combined_test_data):
+class BatchInference:
+    def __init__(self, pipeline_model, all_questions, batch_size):
+        self.pipeline_model = pipeline_model
+        self.all_questions = all_questions
+        self.batch_size = batch_size
+        self.batch_count = 0
+        
+    def __call__(self, examples):
+        # 배치의 첫 번째 질문 출력
+        if len(examples["prompt"]) > 0:
+            question_idx = self.batch_count * self.batch_size
+            if question_idx < len(self.all_questions):
+                print("\n" + "="*80)
+                print(f"질문 {question_idx+1}/{len(self.all_questions)}:")
+                print(self.all_questions[question_idx])
+        
+        with torch.no_grad():
+            outputs = self.pipeline_model(
+                examples["prompt"],
+                do_sample=True,
+                temperature=0.3,
+                top_p=0.85,
+                top_k=50,
+                repetition_penalty=1.2,
+                max_new_tokens=128,
+                return_full_text=False,
+                batch_size=2
+            )
+        
+        batch_results = []
+        for i, output in enumerate(outputs):
+            if isinstance(output, list) and len(output) > 0:
+                generated_text = output[0]['generated_text']
+                batch_results.append(generated_text)
+                
+                # 첫 번째 결과만 출력
+                if i == 0:
+                    print("\n[원본 응답]:")
+                    print(generated_text)
+                    
+                    # 후처리된 결과 출력
+                    processed_text = postprocess_results([generated_text])[0]
+                    print("\n[후처리된 응답]:")
+                    print(processed_text)
+                    print("="*80 + "\n")
+            else:
+                batch_results.append("결과를 생성할 수 없습니다.")
+                
+                # 첫 번째 결과가 실패한 경우에만 출력
+                if i == 0:
+                    print("\n응답 생성 실패")
+                    print("="*80 + "\n")
+        
+        # 배치 카운트 증가
+        self.batch_count += 1
+        
+        torch.cuda.empty_cache()
+        
+        return {"result": batch_results}
+
+def run_test(qa_chain, combined_test_data, test_df):
     """테스트 실행 함수 - 컨텍스트 처리 개선"""
     print(f"테스트 실행 시작... 총 테스트 샘플 수: {len(combined_test_data)}")
     print_gpu_memory()
@@ -253,10 +331,30 @@ def run_test(qa_chain, combined_test_data):
     collection = qa_chain.retriever.vectorstore._collection
     embedding_func = qa_chain.retriever.vectorstore._embedding_function
     
-    def get_context(question):
+    def get_context(idx_and_question):
+        idx, question = idx_and_question
         query_embedding = embedding_func.embed_query(question)
+        
+        # 현재 질문에 해당하는 테스트 데이터 행
+        current_test_row = test_df.iloc[idx]
+        
+        # 메타데이터 기반 필터링 조건 생성
+        where = {
+            "$or": [
+                {"공사종류_대분류": current_test_row['공사종류(대분류)']},
+                {"공사종류_중분류": current_test_row['공사종류(중분류)']},
+                {"공종_대분류": current_test_row['공종(대분류)']},
+                {"공종_중분류": current_test_row['공종(중분류)']},
+                {"사고객체_대분류": current_test_row['사고객체(대분류)']},
+                {"사고객체_중분류": current_test_row['사고객체(중분류)']},
+                {"작업프로세스": current_test_row['작업프로세스']},
+                {"사고원인": current_test_row['사고원인']}
+            ]
+        }
+        
         results = collection.query(
             query_embeddings=[query_embedding],
+            where=where,
             n_results=7,
             include=["documents", "metadatas", "distances"] 
         )
@@ -270,7 +368,8 @@ def run_test(qa_chain, combined_test_data):
         for doc, meta, dist in zip(docs, metadatas, distances):
             weight = 1.0 - min(dist, 0.99)  
             source_info = f"[출처: {meta.get('source', 'unknown')}]"
-            weighted_docs.append(f"[관련도: {weight:.2f}] {source_info}\n{doc}")
+            category_info = f"[분류: {meta.get('공사종류_대분류', '')} > {meta.get('공종_대분류', '')} > {meta.get('사고객체_대분류', '')}]"
+            weighted_docs.append(f"[관련도: {weight:.2f}] {source_info} {category_info}\n{doc}")
         
         return "\n\n".join(weighted_docs)
     
@@ -281,9 +380,12 @@ def run_test(qa_chain, combined_test_data):
     max_workers = min(16, multiprocessing.cpu_count() * 2)
     print(f"병렬 검색에 {max_workers}개의 스레드 사용")
     
+    # 인덱스와 질문을 함께 전달
+    indexed_questions = list(enumerate(all_questions))
+    
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         all_contexts = list(tqdm(
-            executor.map(get_context, all_questions),
+            executor.map(get_context, indexed_questions),
             total=len(all_questions),
             desc="컨텍스트 검색"
         ))
@@ -305,39 +407,17 @@ def run_test(qa_chain, combined_test_data):
     print("Dataset 생성 및 배치 추론 준비 중...")
     dataset = Dataset.from_dict({"prompt": all_prompts})
     
-    def batch_inference(examples):
-        with torch.no_grad():
-            outputs = pipeline_model(
-                examples["prompt"],
-                do_sample=True,
-                temperature=0.3,
-                top_p=0.85,
-                top_k=50,
-                repetition_penalty=1.2,
-                max_new_tokens=128,
-                return_full_text=False,
-                batch_size=2  # 배치 크기 2로 수정
-            )
-        
-        results = []
-        for output in outputs:
-            if isinstance(output, list) and len(output) > 0:
-                results.append(output[0]['generated_text'])
-            else:
-                results.append("결과를 생성할 수 없습니다.")
-        
-        torch.cuda.empty_cache()
-        
-        return {"result": results}
-    
     print("배치 추론 실행 중...")
     inference_start = time.time()
     
     batch_size = get_optimal_batch_size()
     print(f"추론에 배치 크기 {batch_size} 사용")
     
+    # BatchInference 클래스 인스턴스 생성
+    batch_inferencer = BatchInference(pipeline_model, all_questions, batch_size)
+    
     results = dataset.map(
-        batch_inference,
+        batch_inferencer,
         batched=True,
         batch_size=batch_size,
         desc="추론",
@@ -483,6 +563,47 @@ def save_results(test_results, pred_embeddings, model_id, prompt_template, hyper
     print(f"결과가 '{csv_filename}'에 저장되었습니다.")
     print(f"설정 정보가 '{json_filename}'에 저장되었습니다.")
 
+def load_markdown_files(md_directory):
+    """마크다운 파일 로드 함수 - 각 파일을 하나의 청크로 유지"""
+    print(f"마크다운 파일 로드 중... 경로: {md_directory}")
+    
+    md_chunks = []
+    md_chunk_metadatas = []
+    
+    for root, dirs, files in os.walk(md_directory):
+        # 현재 문서 이름 (폴더명)
+        doc_name = os.path.basename(root)
+        if not doc_name:  # 루트 디렉토리 스킵
+            continue
+            
+        for file in files:
+            if file.endswith('.md'):
+                file_path = os.path.join(root, file)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        text = f.read().strip()
+                    
+                    if text:  # 빈 파일 제외
+                        # 페이지 번호 추출 (파일명에서)
+                        page_num = int(file.split('.')[0]) if file.split('.')[0].isdigit() else 0
+                        
+                        # 각 파일을 하나의 청크로 처리
+                        md_chunks.append(text)
+                        md_chunk_metadatas.append({
+                            "source": doc_name,
+                            "type": "Markdown",
+                            "page": page_num,
+                            "path": file_path,
+                            "chunk_id": 0,  # 파일당 하나의 청크
+                            "total_chunks": 1
+                        })
+                        
+                except Exception as e:
+                    print(f"파일 처리 중 오류 발생: {file_path}, 오류: {str(e)}")
+    
+    print(f"마크다운 파일 로드 완료! 총 {len(md_chunks)}개의 청크 생성됨")
+    return md_chunks, md_chunk_metadatas
+
 def main():
     print("프로그램 시작...")
     total_start_time = time.time()
@@ -497,19 +618,32 @@ def main():
     combined_test_data = create_combined_data(test, is_train=False)
     
     print("모델 및 토크나이저 설정 중...")
-    # 모델 ID 저장
     model_id = "Qwen/Qwen2.5-14B-Instruct"
     tokenizer, model = setup_model()
     
     print("학습 문서 생성 중...")
-    train_documents, train_metadatas = create_train_documents(combined_training_data)
-    retriever = setup_retriever(train_documents, train_metadatas)
+    train_documents, train_metadatas = create_train_documents(combined_training_data, train)
+    
+    # 마크다운 파일 로드 및 처리 - 청킹 단계 제거
+    md_directory = "./data/건설안전지침_md"
+    md_chunks, md_chunk_metadatas = load_markdown_files(md_directory)
+    
+    print(f"문서 통합 중... (학습 문서: {len(train_documents)}개, 마크다운: {len(md_chunks)}개)")
+    
+    # 기존 학습 문서와 마크다운 문서 결합
+    all_documents = train_documents + md_chunks
+    all_metadatas = train_metadatas + md_chunk_metadatas
+    
+    print(f"총 {len(all_documents)}개의 문서로 벡터 저장소 구성")
+    
+    # 벡터 저장소 설정 (모든 문서 포함)
+    retriever = setup_retriever(all_documents, all_metadatas)
     
     print("QA 체인 설정 중...")
     qa_chain, prompt_template, hyperparams = setup_qa_chain(model, tokenizer, retriever)
     
     print("테스트 실행 중...")
-    test_results = run_test(qa_chain, combined_test_data)
+    test_results = run_test(qa_chain, combined_test_data, test)
     
     print("임베딩 생성 중...")
     pred_embeddings = create_embeddings(test_results)
